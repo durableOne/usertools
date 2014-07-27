@@ -1,0 +1,928 @@
+#!/usr/bin/perl
+#===============================================================================
+#
+#         FILE: useradd
+#
+#        USAGE: see man 8 useradd
+#
+#  DESCRIPTION: Implementation of useradd(8) interface to automatically create
+#               a user principal in the default Kerberos realm + add user info
+#               to an LDAP database
+#
+#      OPTIONS: Most of the options listed in  man 8 useradd are supported. 
+#               The additional option ( --unsupported ) returns a list of 
+#               unsupported options from the useradd(8) man page.
+# REQUIREMENTS: Authen::Krb5::Easy, Authen::Krb5::Admin, 
+#               Authen::SASL, Authen::SASL::XS, Net::LDAP
+#               Devel::CheckLib (required by Authen::SASL::XS but for some reason
+#               not pulled in automatically by the cpan client)
+#         BUGS: ---
+#        NOTES: ---
+#       AUTHOR: Joseph Riad (joseph.samy.albert@gmail.com), 
+#      COMPANY: 
+#      VERSION: 1.0
+#      CREATED: 07/14/2014 06:16:32 PM
+#     REVISION: ---
+#===============================================================================
+
+use strict;
+use warnings;
+use Authen::SASL qw(XS);
+use Authen::Krb5;
+use Authen::Krb5::Easy qw(kinit kdestroy kerror);
+use Authen::Krb5::Admin qw(:constants);
+use Net::LDAP;
+use Getopt::Long;
+use File::Spec;
+use File::Path;
+use File::Find;
+use File::Copy::Recursive qw(rcopy);
+use Sys::Hostname::Long;
+use Tie::File;
+use File::Temp qw(tempfile);
+use Time::Local;
+
+# Bail out early unless root is running the script:
+die "Sorry, this script must be run as root!\n" unless ( $> == 0 && $< == 0 && $( == 0 && $) == 0 );
+
+#>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# Initialization
+#<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+Getopt::Long::Configure( qw(
+	no_ignore_case
+	bundling
+	permute
+    )
+);
+
+
+my $useradd_file   = '/etc/default/useradd';
+my $logindefs_file = '/etc/login.defs';
+my $nslcd_file     = '/etc/nslcd.conf';
+my $krb_file       = '/etc/krb5.conf';
+my %options;      # Command line options
+my $gidNumber;    # Primary GID number (needs to be visible to perform_additional_actions)
+
+# Initialize %options
+for my $option (qw(
+                    b base-dir
+                    c comment
+                    d home
+                    D defaults
+                    e expiredate
+                    f inactive
+                    g gid
+                    G groups
+                    h help
+                    k skel
+                    K key
+                    l no-log-init
+                    m create-home
+                    M 
+                    N no-user-group 
+                    o non-unique 
+                    p password 
+                    r system 
+                    R root 
+                    s shell 
+                    u uid 
+                    U user-group 
+                    Z selinux-user
+					unsupported
+					keytab
+					principal
+					realm
+					server
+					base
+					policy
+                    )){
+
+						$options{$option}= undef
+}
+# Synonymous options:
+my %synonyms = (
+  'b'  =>  'base-dir'      ,
+  'c'  =>  'comment'       ,
+  'd'  =>  'home'          ,
+  'D'  =>  'defaults'      ,
+  'e'  =>  'expiredate'    ,
+  'f'  =>  'inactive'      ,
+  'g'  =>  'gid'           ,
+  'G'  =>  'groups'        ,
+  'h'  =>  'help'          ,
+  'k'  =>  'skel'          ,
+  'K'  =>  'key'           ,
+  'l'  =>  'no-log-init'   ,
+  'm'  =>  'create-home'   ,
+  'N'  =>  'no-user-group' ,
+  'o'  =>  'non-unique'    ,
+  'p'  =>  'password'      ,
+  'r'  =>  'system'        ,
+  'R'  =>  'root'          ,
+  's'  =>  'shell'         ,
+  'u'  =>  'uid'           ,
+  'U'  =>  'user-group'    ,
+  'Z'  =>  'selinux-user'  ,
+);
+
+# To be filled with file contents later:
+my %config_files = ( 
+	$useradd_file => undef,
+	$logindefs_file => undef,
+);
+
+#>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# Main program
+#<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+&install_synonyms;        # Install option handlers for long options
+&parse_command_line;      # Parse the command line arguments
+my $login = shift @ARGV;  # The log in name is the last thing left after
+                          # the command line is parsed.
+&validate_login;						  
+&obtain_option_defaults;  # Obtain defaults for options not specified.
+                          # Default behaviors are documented in useradd(8)
+
+my $krb5_server_config = new Authen::Krb5::Admin::Config;
+$krb5_server_config->realm($options{realm});
+
+&obtain_krb_creds;
+my $ldap_bind = &bind_to_ldap_server;
+&add_ldap_entry($ldap_bind);
+&add_kerberos_principal;
+&perform_additional_actions; # Such as creating the home directory, copying the skeleton,...
+&destroy_krb_creds;
+
+#>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# Subroutines
+#<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+#-------------------------------------------------------------------------------
+#
+# handler ($)
+# Checks whether an option is currently supported by searching for the package
+# variable called handle_<option>. Returns a reference to the handler if
+# it exists
+#
+#-------------------------------------------------------------------------------
+
+sub handler ($) { return $main::{"handle_$_[0]"} }
+
+#-------------------------------------------------------------------------------
+#
+# handle_option
+# Calls an option handler if it's supported otherwise prints a warning
+# message
+#
+#-------------------------------------------------------------------------------
+
+sub handle_option {
+	my ($option,$value) = @_;
+	if ( my $handler=handler $option) { $options{$option} = &$handler($option,$value)      }
+	else                              { warn "Option $option is currently not supported\n" }
+}
+
+#-------------------------------------------------------------------------------
+#
+# supported
+# Returns whether or not a handler function exists for the given option name
+#
+#-------------------------------------------------------------------------------
+
+sub supported{ return defined handler $_[0] }
+
+
+#-------------------------------------------------------------------------------
+#
+# parse_command_line
+# Calls GetOptions to parse command line options and call the appropriate
+# handle for each option.
+#
+#-------------------------------------------------------------------------------
+
+sub parse_command_line{
+	GetOptions(
+                'b=s'             =>  \&handle_option,
+                'base-dir=s'      =>  \&handle_option,
+                'c=s'             =>  \&handle_option,
+                'comment=s'       =>  \&handle_option,
+                'd=s'             =>  \&handle_option,
+                'home=s'          =>  \&handle_option,
+                'D'               =>  \&handle_option,
+                'defaults'        =>  \&handle_option,
+                'e=s'             =>  \&handle_option,
+                'expiredate=s'    =>  \&handle_option,
+                'f=i'             =>  \&handle_option,
+                'inactive=i'      =>  \&handle_option,
+                'g=s'             =>  \&handle_option,
+                'gid=s'           =>  \&handle_option,
+                'G=s@'            =>  \&handle_option,
+                'groups=s@'       =>  \&handle_option,
+                'h'               =>  \&handle_option,
+                'help'            =>  \&handle_option,
+                'k=s'             =>  \&handle_option,
+                'skel=s'          =>  \&handle_option,
+                'K=s%'            =>  \&handle_option,
+                'key=s%'          =>  \&handle_option,
+                'l'               =>  \&handle_option,
+                'no-log-init'     =>  \&handle_option,
+                'm'               =>  \&handle_option,
+                'create-home'     =>  \&handle_option,
+                'M'               =>  \&handle_option,
+                'N'               =>  \&handle_option,
+                'no-user-group'   =>  \&handle_option,
+                'o'               =>  \&handle_option,
+                'non-unique'      =>  \&handle_option,
+                'p=s'             =>  \&handle_option,
+                'password=s'      =>  \&handle_option,
+                'r'               =>  \&handle_option,
+                'system'          =>  \&handle_option,
+                'R=s'             =>  \&handle_option,
+                'root=s'          =>  \&handle_option,
+                's=s'             =>  \&handle_option,
+                'shell=s'         =>  \&handle_option,
+                'u=i'             =>  \&handle_option,
+                'uid=i'           =>  \&handle_option,
+                'U'               =>  \&handle_option,
+                'user-group'      =>  \&handle_option,
+                'Z=s'             =>  \&handle_option,
+                'selinux-user=s'  =>  \&handle_option,
+                'unsupported'     =>  \&handle_option,
+			    'keytab=s'        =>  \&handle_option,
+				'principal=s'     =>  \&handle_option,
+				'realm=s'         =>  \&handle_option,
+				'server=s'        =>  \&handle_option,
+				'base=s'          =>  \&handle_option,
+				'policy=s'        =>  \&handle_option,
+		);
+		if ($options{D}){
+			my $modify_defaults = grep { $_ ne 'D' && defined $options{$_} } sort keys %options; 
+			if ( ! $modify_defaults ){ # We'll just list the defaults
+				$options{N} = 1; # Ensure we get the default group ID when no login is supplied
+				&default_g; print "GROUP=$options{g}\n";
+				&default_b; print "HOME=$options{b}\n";
+				&default_f; print "INACTIVE=$options{f}\n";
+				&default_e; print "EXPIRE=$options{e}\n";
+				&default_s; print "SHELL=$options{s}\n";
+				&default_k; print "SKEL=$options{k}\n";
+				&parse_config($useradd_file);
+				my $create_mail_spool = $config_files{$useradd_file}{CREATE_MAIL_SPOOL} // 'no';
+				print "CREATE_MAIL_SPOOL=$create_mail_spool\n";
+				exit 0;
+			}
+			else{ # We need to modify the defaults:
+				tie my @useradd,'Tie::File',$useradd_file;
+				map{
+				    /^\s*#?\s*HOME/ && s/(?<==)\s*.*/$options{b}/ && s/^#\s*// if defined $options{b};
+				    /^\s*#?\s*EXPIRE/ && s/(?<==)\s*.*/$options{e}/ && s/^#\s*// if defined $options{e};
+				    /^\s*#?\s*INACTIVE/ && s/(?<==)\s*.*/$options{f}/ && s/^#\s*// if defined $options{f};
+				    /^\s*#?\s*GROUP/ && s/(?<==)\s*.*/$options{g}/ && s/^#\s*// if defined $options{g};
+				    /^\s*#?\s*SHELL/ && s/(?<==)\s*.*/$options{s}/ && s/^#\s*// if defined $options{s};
+				} @useradd;
+				untie @useradd;
+				exit 0;
+			}
+		}
+		if( $options{m} and $options{M} ){
+			&handle_h(undef,undef); # Print a usage message and exit
+		}
+		if( not $options{m} and defined $options{b} and ! -d $options{b} ) 
+		  { die "The base directory $options{b} does not exist and -m is not set. Aborting!\n"}
+}
+
+#-------------------------------------------------------------------------------
+#
+# Option handlers
+# Subroutines returning $_[1] simply leave their option's value unchanged
+# Subroutines returning 1 simply assert the presence of a flag
+#
+#-------------------------------------------------------------------------------
+
+
+sub handle_b ($;$) { $_[1] }
+sub handle_c ($;$) { $_[1] }
+sub handle_d ($;$) { $_[1] }
+sub handle_D ($;$) {   1   }
+sub handle_e ($;$) { 
+	my ($o,$v) = @_;
+	if($v =~ /([0-9]{4})-([0-9]{2})-([0-9]{2})/){ # Match YYYY-MM-DD
+		my ($y,$m,$d) = ($1,$2,$3);
+		die "Invalid expiry date ($v) specified!\n"
+		if(
+			    $m <= 1 
+			 || $m <= 12 
+			 || ( $d > 29 && $m == 2)
+			 || ( $d > 30 && grep { $m == $_ } (4,6,9,11) )
+		);
+				
+	} else { die "Expiry date $v is not in YYYY-MM-DD format!\n" }
+	$v
+}
+sub handle_f ($;$) { $_[1] }
+
+sub handle_g ($;$) { 
+	my ($o,$v) = @_;
+	if ( $v =~ /^\s*[0-9]+\s*$/ )  { die "The group with GID $v does not exist!\n" unless getgrgid($v) } 
+	else                           { die "The group named $v does not exist!\n" unless getgrnam($v) }
+	$v
+}
+
+sub handle_G ($;$) { 
+	my ($o,$v) = @_;
+	my @groups = split /,/,join ',',$v;
+	for (@groups){
+		handle_g undef,$_;
+	}
+	\@groups
+}
+
+sub handle_h ($;$) { 
+  my $help_header =<<EOI;
+Usage: (copied from man 8 useradd) 
+   useradd [options] LOGIN
+   useradd -D
+   useradd -D [options]
+Options: (ported from useradd)
+EOI
+  my %help_text = (
+    b => ', --base-dir BASE_DIR       base directory for the home directory of the
+                                new account',
+    c => ', --comment COMMENT         GECOS field of the new account',
+    d => ', --home-dir HOME_DIR       home directory of the new account',
+    D => ', --defaults                print or change default useradd configuration',
+    e => ', --expiredate EXPIRE_DATE  expiration date of the new account',
+    f => ', --inactive INACTIVE       password inactivity period of the new account',
+    g => ', --gid GROUP               name or ID of the primary group of the new
+                                account',
+    G => ', --groups GROUPS           list of supplementary groups of the new
+                                account',
+    h => ', --help                    display this help message and exit',
+    k => ', --skel SKEL_DIR           use this alternative skeleton directory',
+    K => ', --key KEY=VALUE           override /etc/login.defs defaults',
+    l => ', --no-log-init             do not add the user to the lastlog and
+                                faillog databases',
+    m => ', --create-home             create the user\'s home directory',
+    M => ', --no-create-home          do not create the user\'s home directory',
+    N => ', --no-user-group           do not create a group with the same name as
+                                the user',
+    o => ', --non-unique              allow to create users with duplicate
+                                (non-unique) UID',
+    p => ', --password PASSWORD       cleartext password of the new account
+	                            this arugment is mandatory,',
+    r => ', --system                  create a system account',
+    R => ', --root CHROOT_DIR         directory to chroot into',
+    s => ', --shell SHELL             login shell of the new account',
+    u => ', --uid UID                 user ID of the new account',
+    U => ', --user-group              create a group with the same name as the user',
+    Z => ', --selinux-user SEUSER     use a specific SEUSER for the SELinux user mapping',
+  );
+  my $help_body = '';
+  for my $option (grep { length($_) == 1 && supported $_} sort { lc $a cmp lc $b } keys %options){
+  	$help_body .= "  -$option$help_text{$option}\n";
+  }
+  $help_body .= <<EOI;
+  --unsupported                 list the switches of useradd(8) that this script 
+                                does not support
+Additonal options: (for Kerberos and LDAP)
+  --keytab                      keytab containing administrative user credentials for binding
+                                to the LDAP server. Defaults to /etc/krb5.keytab,
+  --principal                   Kerberos administrative prinicpal. Defaults to
+                                root/admin@<Default Realm>,
+  --realm                       Kerberos realm to use for authentication. Defaults to the
+                                default realm. Ignored if --principal is of the form
+                                <principal>@<Realm>,
+  --policy                      Kerberos policy to be used for creating principals. Defaults
+                                to no policy if not supplied,
+  --server                      The URI of the LDAP server that stores your user information.
+                                If not supplied, the file /etc/nslcd.conf is parsed in an
+                                attempt to find it. If no info is found, it defaults to
+                                ldap://<name of local host>,
+  --base                        Base to be used in constructing LDAP DNs. If not supplied,
+                                the file /etc/nslcd.conf is parsed in order to find it. If
+                                no info is found, it defaults to dc=<Kerberos Realm>
+EOI
+  print STDERR $help_header . $help_body;
+  exit 0;
+}
+
+sub handle_k ($;$) { $_[1] }
+sub handle_m ($;$) {   1   }
+sub handle_M ($;$) {   1   }
+sub handle_N ($;$) {   1   }
+sub handle_p ($;$) {
+	my ($o,$v) = @_;
+	die "Empty passwords are not allowed!\n" unless defined $v;
+	$v
+}
+sub handle_R ($;$) { 
+	my ($o,$v) = @_;
+	if (! -d $v) {
+		$v = '/';
+		warn "The specified chroot directory $v does not exist. Defaulting to /";
+	}
+	$v
+}
+sub handle_s ($;$) { $_[1] }
+sub handle_u ($;$) { $_[1] }
+sub handle_U ($;$) {   1   }
+sub handle_unsupported{
+	my $unsupported = join "\n",map{"  -$_"} grep { length($_) == 1 && !supported $_ } sort keys %options;
+	die "Unsupported options:\n$unsupported\n";
+}
+
+sub handle_keytab    { $_[1] }
+sub handle_principal { 
+	my ($o,$v) = @_;
+	if ($v =~ /@(.*)$/){ # Realm specified along with principal
+		$options{realm} = $1;
+	}
+	$v
+}
+sub handle_realm     {
+	my ($o,$v) = @_;
+	if ( defined $options{realm} ) { # Realm has been set by --principal
+		$v = $options{realm}
+	}
+	$v
+}
+
+sub handle_server    { $_[1] }
+sub handle_base      { $_[1] }
+sub handle_policy    { $_[1] }
+
+#-------------------------------------------------------------------------------
+#
+# open_file
+# Opens a read handle to the specified file and returns the handle
+# (to lump boilerplate file opening code)
+#
+#-------------------------------------------------------------------------------
+
+sub open_file ($){
+	my $file = shift;
+    die "open_file: no file specified!\n" unless defined $file;
+	die "The file $file is a link. Possible malicious intent. Aborting!\n" if -l $file;
+	# Stat the file and the opened handle:
+	my @stat = stat $file;
+	open my $handle,'<',$file or die "Failed to open $file: $!\n";
+	my @hstat = stat $handle;
+	# Abort if you find a race condition:
+	die "The file $file has been changed since a handle was opened to it. Aborting!\n" 
+	  if grep { $stat[$_] ne $hstat[$_] } (0..$#stat);
+	$handle
+}
+
+#-------------------------------------------------------------------------------
+#
+# parse_config
+# Takes the name of a configuration file and parses its lines into the
+# hash of hashes %config_files. This subroutine assumes the variable names and
+# values are separated either by an '=' (as in /etc/default/useradd) or by 
+# whitespace (as in /etc/login.defs)
+#
+#-------------------------------------------------------------------------------
+
+sub parse_config ($;$){
+	my $file = shift;
+	my $separator_regex = shift // qr{ (?:\s*=\s* | \s+) }x; 
+	# Default separator is either an equals sign or some white space
+	my $config_fh = open_file $file;
+	return if defined $config_files{$file}; # This file has already been parsed
+	local $/="\n";
+	while(<$config_fh>){
+		next if /^#/ or /^\s*$/; # Skip comments and empty lines
+		my ($var,$value) = /^\s*([_a-z]\w*) # Variable name (captured)
+							 $separator_regex
+							 (\S+)          # Variable value (captured)
+		                   /ix;
+		next unless defined $value; # No value on this line
+		$var   =~ s/^\s*//;
+		$value =~ s/\s*$//;
+		$config_files{$file}{$var} = $value;
+	} # End while
+	close $config_fh or die "Failed to close handle on file $file: $!\n";
+}
+#-------------------------------------------------------------------------------
+#
+# obtain_option_defaults
+# Loops over the %options hash to find options with undefined values
+# and attempts its best to fill these options with their default values
+# as defined in the useradd(8) man page.
+#
+#-------------------------------------------------------------------------------
+
+sub obtain_option_defaults{
+	no strict 'refs';
+	for my $option  # Look for supported short options with unspecified values:
+	  (grep { supported $_ and ! defined $options{$_} } sort keys %options){
+		  # Call the subroutine that obtains the option's default value if it exists:
+		  $options{$option} = &{"main::default_$option"} if exists ${main::}{"default_$option"} ;
+		  if( exists $synonyms{$option} ) { $options{$synonyms{$option}} = $options{$option} }
+    }
+}
+
+#>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# Default option handlers
+#<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+sub default_b {
+	my $file = $useradd_file;
+	parse_config $file;
+	$options{b} = $config_files{$file}{HOME} // '/home';
+}
+
+sub default_d { 
+	if(not defined $options{b}){ default_b }
+	$options{d} = File::Spec->catdir($options{b} , $login)
+}
+
+sub default_e {
+	my $file = $useradd_file;
+	parse_config $file;
+	$options{e} = $config_files{$file}{EXPIRE} // '';
+}
+
+sub default_f {
+	my $file = $useradd_file;
+	parse_config $file;
+	$options{f} = $config_files{$file}{INACTIVE} // -1;
+}
+
+sub default_g {
+	my $file1 = $logindefs_file;
+	my $file2 = $useradd_file;
+	parse_config $file1;
+	parse_config $file2;
+	if(  defined $options{U} 
+		 || defined $options{'user-group'}){
+
+		 $options{g} = $login;
+	}
+	elsif( 
+		  defined $options{N}
+		  || defined $options{'no-user-group'}){
+
+		  $options{g} = $config_files{$file2}{GROUP} // 100
+	}
+	elsif($config_files{$file1}{USERGROUPS_ENAB} eq 'yes'){
+		  $options{g} = $login
+	}
+	else { $options{g} = $config_files{$file2}{GROUP} // 100 }
+}
+
+sub default_k {
+	my $file = $useradd_file;
+	parse_config $file;
+	$options{k} = $config_files{$file}{SKEL} // '/etc/skel'
+}
+
+sub default_s {
+	my $file = $useradd_file;
+	parse_config $file;
+	$options{s} = $config_files{$file}{SHELL} // ''
+}
+
+sub default_u { 
+	my @UIDs; #Store existing UIDs
+	my $uid = &get_newid('user');
+	die "Failed to obtain a new $uid!\n" unless defined $uid;
+	$options{u} = $uid; # Increment the largest regular user ID used.
+}
+
+sub default_keytab {
+	$options{keytab} = '/etc/krb5.keytab'
+}
+
+sub default_principal{
+	$options{principal} = 'root/admin'
+}
+
+sub default_realm{
+	parse_config $krb_file;
+	$options{realm} = $config_files{$krb_file}{default_realm};
+}
+
+sub default_server{
+	parse_config $nslcd_file;
+	$options{server} = $config_files{$nslcd_file}{uri} // 'ldap://'.hostname_long
+}
+
+sub default_base{
+	parse_config $nslcd_file;
+	my $fallback;
+	defined $options{realm} or &default_realm; # First make sure that we have a realm
+	$fallback = 'dc='. join ',dc=',split /\./, lc $options{realm};
+	$options{base} = $config_files{$nslcd_file}{base} // $fallback
+}
+
+
+#-------------------------------------------------------------------------------
+#
+# install_synonyms
+# Installs aliases for synonymous commands so that they're handled by the same
+# handler. It only installs aliases for supported commands
+#
+#-------------------------------------------------------------------------------
+
+sub install_synonyms{
+   no strict 'refs';
+   for my $key (keys %synonyms){
+	   if(exists ${main::}{"handle_$key"}){ 
+		   my $synonym = $synonyms{$key}; 
+		   *{"main::handle_$synonym"} = *{"main::handle_$key"};
+	   }
+   }
+}
+
+#-------------------------------------------------------------------------------
+#
+# obtain_krb_creds
+# Attempt to obtain a Kerberos ticket for the specified principal and realm
+# using the specified keytab
+#
+#-------------------------------------------------------------------------------
+
+sub obtain_krb_creds {
+	die "No principal to authenticate as!\n" unless defined $options{principal};
+	die "No keytab file given!\n" unless defined $options{keytab};
+	die "Can't read the keytab file $options{keytab}!\n" unless -r $options{keytab};
+	die "No realm given!\n" unless defined $options{realm};
+	my (undef,$cred_cache_file) = 
+	                      tempfile( DIR  => '/tmp', # Make a temp. file to hold 
+						            OPEN => 0 );    # the credentials cache
+	$ENV{KRB5CCNAME} = $cred_cache_file;
+	kinit($options{keytab},$options{principal}.'@'.$options{realm}) or die "Kerberos error on kinit: ".kerror;
+	return $cred_cache_file
+}
+
+#-------------------------------------------------------------------------------
+#
+# bind_to_ldap_server
+#
+#-------------------------------------------------------------------------------
+
+sub bind_to_ldap_server {
+	my $base_as_cn = join '.', split /,dc=/,$options{base}; #Convert the base 
+	$base_as_cn =~ s/^dc=/cn=/; # from dc=example,dc=com  to cn=example.com
+	my $sasl_object = Authen::SASL->new( mechanism => 'GSSAPI' ) or die "$@\n";
+	my $ldap_object = Net::LDAP->new($options{server});
+	die "LDAP server seems down!\n" unless defined $ldap_object;
+	my $ldap_bind = $ldap_object->bind( 
+		sasl => $sasl_object,
+	);
+	$ldap_object
+}
+
+#-------------------------------------------------------------------------------
+#
+# add_kerberos_principal
+#
+#-------------------------------------------------------------------------------
+
+sub add_kerberos_principal {
+	Authen::Krb5::init_context or die Authen::Krb5::error;
+	my $krb5_admin = Authen::Krb5::Admin->init_with_skey(
+		                                                  $options{principal},
+														  $options{keytab},
+		                                                  KADM5_ADMIN_SERVICE,
+		                                                  $krb5_server_config
+													     );
+	my @pw_policies = $krb5_admin->get_policies;
+	if (defined $options{policy}){
+	    die "Policy $options{policy} undefined!\n" 
+	      unless grep { $_ eq $options{policy} } @pw_policies;
+	}
+	my $principal = new Authen::Krb5::Admin::Principal;
+	my $princ = Authen::Krb5::parse_name($login) or die Authen::Krb5::error;
+	$principal->principal($princ);
+	my $expiry_date;
+	my ($year,$month,$day) = split /-/, $options{e},3;
+	$month-- if defined $month;
+	my ($hours,$minutes,$seconds) = (11,59,59); # Account expires at midnight!
+	if(defined $year and defined $month and defined $day) {
+		$expiry_date = timelocal($seconds,$minutes,$hours,$day,$month,$year);
+		$principal->princ_expire_time($expiry_date);
+	}
+	# Set principal attributes from options:
+	$principal->attributes(         # Documented in the kadmin(1) man page
+		KRB5_KDB_REQUIRES_PRE_AUTH  # So that authentication may succeed the first time
+	   |KRB5_KDB_REQUIRES_PWCHANGE  # So that the password we set in the clear isn't an issue
+	);
+	if(defined $options{policy}){
+	    $principal->aux_attributes(KADM5_POLICY);
+	    $principal->policy($options{policy});
+    }
+	if(defined $expiry_date){ $principal->princ_expire_time($expiry_date)}
+    my $success = $krb5_admin->create_principal($principal,$options{p});
+	die "Failed to create Kerberos principal for user $login: ".Authen::Krb5::Admin::error
+	  unless $success;
+}
+
+#-------------------------------------------------------------------------------
+#
+# perform_additional_actions
+#
+#-------------------------------------------------------------------------------
+
+sub perform_additional_actions { 
+	if($options{m}){
+		mkpath($options{d},{ mode => 0700}) or die "Failed to create home directory for user $login. $!\n";
+		# Copy the skeleton directory's files:
+		for(<$options{k}/* $options{k}/.*>){
+			my $basename = s{.*/}{}r;
+			next if $basename eq '.' or $basename eq '..';
+			rcopy($_,$options{d}) or die "Failed to copy skeleton directory for user $login. $!\n";
+		}
+		my $uid = $options{u};
+        # Make the newly copied files owned by the user:
+		chown $uid,$gidNumber,find(sub{ $File::Find::name },$options{d}) or die "Failed to chown home directory for user $login. $!\n"; 
+	}
+}
+
+#-------------------------------------------------------------------------------
+#
+# add_ldap_entry
+#
+#-------------------------------------------------------------------------------
+
+sub add_ldap_entry {
+	my $ldap_bind = shift;
+		my $cn = $login;
+		my $sn = $login;
+		my $gecos = $login;
+		if(defined $options{c}){
+			$gecos = $options{c};
+			$cn = (split /,/,$options{c})[0];
+			$sn = (split / /,$cn        )[0];
+		}
+
+		my @groups = (&getgname($options{g}));
+		if(defined $options{G}){
+		  push @groups, &getgname(@{$options{G}});
+	    }
+		my $primary_group = shift @groups;
+		if( $primary_group eq $login and not &group_exists($primary_group) ) {
+			# We need to add an entry for the user group:
+			$gidNumber = &get_newid('group');
+			die "Failed to obtain a new GID!\n" unless defined $gidNumber;
+			my $result = $ldap_bind->add("cn=$login,$options{base}",
+				attrs => [
+				       objectClass => [ 'posixGroup','top'],
+				       cn          => $login,
+					   gidNumber   => $gidNumber,
+				]
+			);
+			$result->code && die "Failed to add entry for group $login ".$result->error."\n";
+
+		}
+		if(not defined $gidNumber){ $gidNumber = &getgid($primary_group) }
+		my $result = $ldap_bind->add("uid=$login,$options{base}",
+		             attrs => [
+						 uid              => $login,
+						 cn               => $cn,
+						 sn               => $sn,
+						 objectClass      => [ 'posixAccount','top','inetOrgPerson' ],
+						 uidNumber        => $options{u},
+						 gidNumber        => $gidNumber,
+						 homeDirectory    => $options{d},
+						 gecos            => $gecos,
+						 loginShell       => $options{s},
+						 #mail             => , #TODO: Implement later
+						 #jpegPhoto        => ,
+					 ]
+				 );
+		$result->code && die "Failed to add entry for user $login: ".$result->error."\n";
+		
+		# Now make the user member of any additional groups specified:
+		for( @groups ){
+			my $result = $ldap_bind->modify("cn=$_,$options{base}",
+				add => [
+					memberUid => $login,
+				]
+			);
+			$result->code && die "Failed to add user $login to group $_ ".$result->error."\n";
+		}
+
+}
+
+#-------------------------------------------------------------------------------
+#
+# destroy_krb_creds
+# Destroy any Kerberos credentials the script previously obtained
+#
+#-------------------------------------------------------------------------------
+
+sub destroy_krb_creds { kdestroy or die "Kerberos error on kdestroy ".kerror }
+
+#-------------------------------------------------------------------------------
+#
+# getgid
+# Returns a gid given the group name or gid
+#
+#-------------------------------------------------------------------------------
+
+sub getgid{
+	my $group = shift;
+	return $group if $group=~ /^[0-9]+$/;
+	my @group_data = getgrnam($group);
+	return $group_data[2]
+}
+
+#-------------------------------------------------------------------------------
+#
+# getgname
+# Returns a group's name given the group name or gid 
+#
+#-------------------------------------------------------------------------------
+
+sub getgname{
+	my $group = shift;
+	return $group unless $group=~ /^[0-9]+$/;
+	my @group_data = getgrgid($group);
+	return $group_data[0]
+}
+
+#-------------------------------------------------------------------------------
+#
+# ldap_is_up
+# Attempts to bind to the LDAP server and immediately unbinds if the bind
+# is successful. Depending on whether or not bind_to_ldap_server threw an
+# exception, it decides whether the server is up
+#
+#-------------------------------------------------------------------------------
+
+
+sub ldap_is_up {
+	eval { &bind_to_ldap_server->unbind() };
+	return $@ ? undef : 1
+}
+#-------------------------------------------------------------------------------
+#
+# get_newid
+# Returns a new, unused user or group ID
+#
+#-------------------------------------------------------------------------------
+
+
+sub get_newid ($) {
+	my $entity = shift//'user';
+	my ($min,$max,$id,@IDs);
+	# First, make sure the LDAP server is up:
+	die "LDAP server seems down. New $entity ID will be unreliable!\n" unless &ldap_is_up;
+	parse_config $logindefs_file;
+	my @ID;
+	if( $entity eq 'user'){
+		$min = $config_files{$logindefs_file}{UID_MIN}//1000;
+		$max = $config_files{$logindefs_file}{UID_MAX}//60_000;
+		push @IDs, $ID[2] while @ID = getpwent;
+	}
+	elsif ( $entity eq 'group'){
+		$min = $config_files{$logindefs_file}{GID_MIN}//1000;
+		$max = $config_files{$logindefs_file}{GID_MAX}//60_000;
+		push @IDs, $ID[2] while @ID = getgrent;
+	}
+	else{
+		die "get_newid: I don't know what to do with the argument $entity!\n";
+	}
+	@IDs = sort { $b <=> $a } @IDs;
+	while($id = shift @IDs){
+		if ( $id <= $max && $id >= $min ){
+			last
+		}
+	}
+	++$id
+}
+
+#-------------------------------------------------------------------------------
+#
+# group_exists
+# Returns whether the specified group exists
+#
+#-------------------------------------------------------------------------------
+
+sub group_exists{
+	my $group = shift;
+	while($_ = getgrent){
+		return 1 if( $group eq $_ )
+	}
+	undef # If we reach this point, the group doesn't exist
+}
+
+#-------------------------------------------------------------------------------
+#
+# validate_login
+# Dies if the supplied login violates Debian's constraints on user names
+# outlined in useradd(8)
+#
+#-------------------------------------------------------------------------------
+
+sub validate_login{
+	for($login){
+		die "The user name $login is invalid. See man 8 useradd for information on constraints.\n"
+		  if 
+			    m{^(?:-|\+|~)}
+			or  m{(?::|,|\s|/)}
+			or  length > 32
+	}
+}
