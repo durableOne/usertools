@@ -1,0 +1,250 @@
+#!/usr/bin/perl 
+#===============================================================================
+#
+#         FILE: userdel
+#
+#        USAGE: See man 8 userdel
+#
+#  DESCRIPTION: 
+#
+#      OPTIONS: ---
+# REQUIREMENTS: In addition to the requirements of useradd, it needs Proc::ProcessTable
+#         BUGS: ---
+#        NOTES: ---
+#       AUTHOR: Joseph Riad (joseph.samy.albert@gmail.com), 
+#      COMPANY: 
+#      VERSION: 1.0
+#      CREATED: 07/28/2014 04:06:05 PM
+#     REVISION: ---
+#===============================================================================
+
+use strict;
+use warnings;
+use Getopt::Long;
+use File::Path qw(remove_tree);
+use Proc::ProcessTable;
+
+our %options;
+
+# Bail out early unless root is running the script:
+die "Sorry, this script must be run as root!\n" unless ( $> == 0 && $< == 0 && $( == 0 && $) == 0 );
+
+#>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# Initialization
+#<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+Getopt::Long::Configure( qw(
+	no_ignore_case
+	bundling
+	permute
+    )
+);
+
+my @option_pairs = qw(
+                    f force
+					h help
+					r remove
+					R root
+					Z selinux-user
+				);
+
+# Initialize options:
+for my $option (@option_pairs){
+		$options{$option} = undef
+}
+
+our %config_files;
+our %synonyms = @option_pairs;
+
+my $logindefs_file = '/etc/login.defs';
+$config_files{$logindefs_file} = undef;
+
+use UtilitySubs;
+
+#>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# Main Program
+#<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+&install_synonyms;
+&parse_command_line;
+my $login = shift @ARGV;  # The log in name is the last thing left after
+                          # the command line is parsed.
+&obtain_option_defaults;  # Obtain defaults for options not specified.
+                          # Default behaviors are documented in userdel(8)
+my $kadm = &build_kadm_object;
+
+&validate_login;
+if ( not $options{f}){
+	&check_if_we_can_proceed  # Make sure the user account can be safely deleted
+}
+&obtain_krb_creds;
+my $ldap_bind = &bind_to_ldap_server;
+&rm_ldap_entry;
+&rm_kerberos_principal;
+&perform_additional_actions; # Such as deleting the home directory, clearing Kerberos and LDAP ACLs,...
+&destroy_krb_creds;
+
+#>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# Subroutines
+#<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+#-------------------------------------------------------------------------------
+#
+# parse_command_line
+# Calls GetOptions to parse command line options and call the appropriate
+# handle for each option.
+#
+#-------------------------------------------------------------------------------
+
+sub parse_command_line{
+    GetOptions(
+		         f        => \&handle_option,
+				 force    => \&handle_option,
+				 h        => \&handle_option,
+				 help     => \&handle_option,
+				 r        => \&handle_option,
+				 remove   => \&handle_option,
+			);
+}
+
+#-------------------------------------------------------------------------------
+#
+# Option handlers
+# Subroutines returning $_[1] simply leave their option's value unchanged
+# Subroutines returning 1 simply assert the presence of a flag
+#
+#-------------------------------------------------------------------------------
+
+sub handle_f ($;$){ 1 }
+sub handle_r ($;$){ 1 }
+sub handle_h ($;$){
+	my $script_name = $0;
+	$script_name =~ s{.*/}{}; # Keep the basename only
+	my $help_header = <<EOI;
+Usage: (copied from man 8 $script_name) 
+   $script_name [options] LOGIN
+Options: (ported from $script_name)
+EOI
+  my %help_text = (
+	f => ', --force                   force removal of files',
+    h => ', --help                    display this help message and exit',
+	r => ', --remove                  remove home directory and mail spool',
+	R => ', --root CHROOT_DIR         directory to chroot into',
+	Z => ', --selinux-user            remove any SELinux user mapping for the user',
+  );
+  my $help_body = '';
+  for my $option (grep { length($_) == 1 && supported $_} sort { lc $a cmp lc $b } keys %options){
+  	$help_body .= "  -$option$help_text{$option}\n";
+  }
+  $help_body .= &add_common_help_message; # Additional options for LDAP and Kerberos
+  print STDERR $help_header . $help_body;
+  exit 0;
+}
+
+#-------------------------------------------------------------------------------
+#
+# validate_login
+# Dies if the supplied login doesn't exist in the LDAP or Kerberos databases.
+#
+#-------------------------------------------------------------------------------
+
+
+sub validate_login {
+	my $is_in_ldap = getpwnam $login;
+	my $is_in_krb = grep { $_ eq "$login@".uc $options{realm} } $kadm->get_principals;
+	if( $is_in_ldap and $is_in_krb ){
+		return
+	}
+	elsif ( $is_in_krb and not $is_in_ldap ){
+		warn "The given login $login is not in the LDAP database!\n";
+		return
+ 	}
+	elsif ( $is_in_ldap and not $is_in_krb ){
+		warn "The given principal $login\@".uc ($options{realm})." is not in the Kerberos database!\n";
+	    return
+	}
+	else{
+		die "The given user $login isn't found in either the LDAP or Kerberos databases!\n";
+	}
+}
+
+#-------------------------------------------------------------------------------
+#
+# rm_ldap_entry
+# Remove user entry from LDAP database
+#
+#-------------------------------------------------------------------------------
+
+sub rm_ldap_entry{
+	my $dc = 'dc='.join ',dc=',split /\./,lc $options{realm};
+	my $dn = "uid=${login},$dc";
+	my $result = $ldap_bind->delete($dn);
+	$result->code && warn "Failed to delete LDAP entry for user $login. ".$result->error;
+	# Delete the primary group if necessary:
+	parse_config $logindefs_file;
+	for( $config_files{$logindefs_file}{USERGROUPS_ENAB} ){
+		if( defined $_ and $_ eq 'yes' ) {
+			# Find out if there's a group named after our user:
+			my ($gid) = (getgrnam $login)[2];
+			return unless $gid;
+			# Is this group used as another user's primary group:
+			my $gid_in_use = undef;
+			while( my @entry = getpwent ){
+				next if $entry[0] eq $login; # In case the entry is still cached
+				$gid_in_use = 1 if $entry[3] == $gid;
+			}
+			if ( $gid_in_use ){
+				if ($options{f}){
+					 $dn = "cn=$login,$dc";
+					 $result = $ldap_bind->delete($dn);
+					 $result->code && warn "Failed to delete LDAP entry for group $login. ".$result->error;
+				}
+			}
+		}
+	}
+}
+
+#-------------------------------------------------------------------------------
+#
+# rm_kerberos_principal
+# Remove principal entry from Kerberos database
+#
+#-------------------------------------------------------------------------------
+
+sub rm_kerberos_principal{
+	my $krb5_princ = Authen::Krb5::parse_name($login) or die Authen::Krb5::error;
+	my $success = $kadm->delete_principal($krb5_princ);
+		die Authen::Krb5::Admin::error unless $success;
+}
+
+#-------------------------------------------------------------------------------
+#
+# check_if_we_can_proceed
+# Does nothing if the user account can be deleted safely. Dies with a helpful
+# message otherwise.
+#
+#-------------------------------------------------------------------------------
+
+sub check_if_we_can_proceed{
+	my $ps = new Proc::ProcessTable;
+	my $uid = (getpwnam $login)[2]; # Get the user's UID
+	for my $process (@{$ps->table}){
+		if($process->uid == $uid ){
+			my $pid = $process->pid;
+			die "userdel: user $login is currently used by process $pid\n";
+		}
+	}
+	1
+}
+
+sub perform_additional_actions {
+	if($options{r}){
+		my $home_dir = (getpwnam $login)[-2];
+		$home_is_being_used = not system "lsof $home_dir";
+		my $can_delete = 1;
+		$can_delete = 0 if $home_is_being_used and not $options{f};
+		remove_tree($home_dir,{ error => \my $error}) if $can_delete;
+		warn "Failed to remove user $login home directory. ".@$error if @$error;
+	}
+	#TODO: Remove mail spool,crontab,at and any LDAP or Kerberos ACLs relating to the user
+}
