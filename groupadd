@@ -1,0 +1,255 @@
+#!/usr/bin/perl
+#===============================================================================
+#
+#         FILE: groupadd
+#
+#        USAGE: see man 8 groupadd
+#
+#  DESCRIPTION: Implementation of groupadd(8) interface to automatically create
+#               a user principal in the default Kerberos realm + add user info
+#               to an LDAP database
+#
+#      OPTIONS: Most of the options listed in  man 8 groupadd are supported. 
+#               The additional option ( --unsupported ) returns a list of 
+#               unsupported options from the groupadd(8) man page.
+# REQUIREMENTS: Authen::Krb5::Easy, 
+#               Authen::SASL, Authen::SASL::XS, Net::LDAP
+#               Devel::CheckLib (required by Authen::SASL::XS but for some reason
+#               not pulled in automatically by the cpan client)
+#         BUGS: ---
+#        NOTES: ---
+#       AUTHOR: Joseph Riad (joseph.samy.albert@gmail.com), 
+#      COMPANY: 
+#      VERSION: 1.0
+#      CREATED: 07/30/2014 12:21 AM
+#     REVISION: ---
+#===============================================================================
+
+use strict;
+use warnings;
+use Getopt::Long;
+
+# Bail out early unless root is running the script:
+die "Sorry, this script must be run as root!\n" unless ( $> == 0 && $< == 0 && $( == 0 && $) == 0 );
+
+#>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# Initialization
+#<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+Getopt::Long::Configure( qw(
+	no_ignore_case
+	bundling
+	permute
+    )
+);
+
+
+my $groupadd_file   = '/etc/default/groupadd';
+my $logindefs_file = '/etc/login.defs';
+my $nslcd_file     = '/etc/nslcd.conf';
+our %options;      # Command line options
+my $gidNumber;    # Primary GID number (needs to be visible to perform_additional_actions)
+
+# Initialize %options
+for my $option (qw(
+                    f force
+                    g gid
+                    h help
+                    K key
+                    o non-unique 
+                    p password 
+                    r system 
+                    R root 
+                    )){
+
+						$options{$option}= undef
+}
+# Synonymous options:
+our %synonyms = (
+  'f'  =>  'force'         ,
+  'g'  =>  'gid'           ,
+  'h'  =>  'help'          ,
+  'K'  =>  'key'           ,
+  'o'  =>  'non-unique'    ,
+  'p'  =>  'password'      ,
+  'r'  =>  'system'        ,
+  'R'  =>  'root'          ,
+);
+
+# To be filled with file contents later:
+our %config_files = ( 
+	$groupadd_file => undef,
+	$logindefs_file => undef,
+);
+use UtilitySubs; # Subroutines common to all user tools
+#>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# Main program
+#<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+&install_synonyms;        # Install option handlers for long options
+&parse_command_line;      # Parse the command line arguments
+my $group = shift @ARGV;  # The group name is the last thing left after
+                          # the command line is parsed.
+&validate_group;
+&obtain_option_defaults;  # Obtain defaults for options not specified.
+                          # Default behaviors are documented in groupadd(8)
+
+&obtain_krb_creds;
+my $ldap_bind = &bind_to_ldap_server;
+&add_ldap_entry;
+&destroy_krb_creds;
+
+#>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# Subroutines
+#<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+#-------------------------------------------------------------------------------
+#
+# parse_command_line
+# Calls GetOptions to parse command line options and call the appropriate
+# handle for each option.
+#
+#-------------------------------------------------------------------------------
+
+sub parse_command_line{
+	GetOptions(
+                'f'               =>  \&handle_option,
+                'force'           =>  \&handle_option,
+                'g=s'             =>  \&handle_option,
+                'gid=s'           =>  \&handle_option,
+                'h'               =>  \&handle_option,
+                'help'            =>  \&handle_option,
+                'K=s%'            =>  \&handle_option,
+                'key=s%'          =>  \&handle_option,
+                'o'               =>  \&handle_option,
+                'non-unique'      =>  \&handle_option,
+                'p=s'             =>  \&handle_option,
+                'password=s'      =>  \&handle_option,
+                'r'               =>  \&handle_option,
+                'system'          =>  \&handle_option,
+                'R=s'             =>  \&handle_option,
+                'root=s'          =>  \&handle_option,
+                'unsupported'     =>  \&handle_option,
+				'keytab=s'        =>  \&handle_option,
+				'principal=s'     =>  \&handle_option,
+				'realm=s'         =>  \&handle_option,
+				'server=s'        =>  \&handle_option,
+				'base=s'          =>  \&handle_option,
+				'policy=s'        =>  \&handle_option,
+		);
+		if($options{f}){
+			if(getgrnam $group){ # Group already exists
+				exit 0;
+			}
+		}
+}
+
+#-------------------------------------------------------------------------------
+#
+# Option handlers
+# Subroutines returning $_[1] simply leave their option's value unchanged
+# Subroutines returning 1 simply assert the presence of a flag
+#
+#-------------------------------------------------------------------------------
+
+
+sub handle_f ($;$) { 1 }
+
+sub handle_g ($;$) { 
+	my ($o,$v) = @_;
+	if ( getgrgid $v ){
+		if ( not defined $options{f} ){
+			warn "The GID $v already exists!\n";
+			exit 1
+		}
+		else{
+			$v = &get_newid('group',$logindefs_file);
+		}
+	}
+	$v
+}
+
+sub handle_h ($;$) { 
+  my $script_name = $0;
+  $script_name =~ s{.*/}{}; # Keep the basename only
+  my $help_header =<<EOI;
+Usage: (copied from man 8 $script_name) 
+   $script_name [options] LOGIN
+   $script_name -D
+   $script_name -D [options]
+Options: (ported from $script_name)
+EOI
+  my %help_text = (
+    f => ', --force                   exit successfully if the group already exists',
+    g => ', --gid GID                 use GID for the new group',
+    h => ', --help                    display this help message and exit',
+    K => ', --key KEY=VALUE           override /etc/login.defs defaults',
+    o => ', --non-unique              allow to create groups with duplicate
+                                (non-unique) UID',
+    p => ', --password PASSWORD       use this encrypted password for the new group',
+    r => ', --system                  create a system account',
+    R => ', --root CHROOT_DIR         directory to chroot into',
+    s => ', --shell SHELL             login shell of the new account',
+  );
+  my $help_body = '';
+  for my $option (grep { length($_) == 1 && supported $_} sort { lc $a cmp lc $b } keys %options){
+  	$help_body .= "  -$option$help_text{$option}\n";
+  }
+  $help_body .= &add_common_help_message; # Additional options for LDAP and Kerberos
+  print STDERR $help_header . $help_body;
+  exit 0;
+}
+
+sub handle_p ($;$) { $_[1] }
+
+#>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# Default option handlers
+#<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+sub default_g { 
+	my $gid = &get_newid('group',$logindefs_file);
+	die "Failed to obtain a new GID!\n" unless defined $gid;
+	$options{g} = $gid
+}
+
+sub default_p { '' } # Default group password is empty
+
+
+#-------------------------------------------------------------------------------
+#
+# add_ldap_entry
+#
+#-------------------------------------------------------------------------------
+
+sub add_ldap_entry {
+		my $cn = $group;
+		my $result = $ldap_bind->add("cn=$cn,$options{base}",
+			attrs => [
+			       objectClass => [ 'posixGroup','top'],
+			       cn          => $cn,
+				   gidNumber   => $options{g},
+			]
+		);
+		$result->code && die "Failed to add entry for group $group ".$result->error."\n";
+}
+
+#-------------------------------------------------------------------------------
+#
+# validate_group
+# Dies if the supplied group name violates Debian's constraints on group names
+# outlined in groupadd(8)
+#
+#-------------------------------------------------------------------------------
+
+sub validate_group{
+	parse_config $nslcd_file;
+	my $valid_name_regex = $config_files{$nslcd_file}{validnames} // qr{^[a-z0-9._\@\$][a-z0-9._\@$ \\~-]*[a-z0-9._\@$~-]*$}i;
+	for($group){
+		die "The group name $_ is invalid. See man 8 groupadd and man 5 nslcd.conf for information on constraints.\n"
+		  if 
+			    m{^(?:-|\+|~)}
+			or  m{(?::|,|\s|/)}
+			or  length > 32
+		    or not m{$valid_name_regex}
+	}
+}

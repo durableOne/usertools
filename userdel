@@ -22,7 +22,9 @@ use strict;
 use warnings;
 use Getopt::Long;
 use File::Path qw(remove_tree);
+use File::Spec; 
 use Proc::ProcessTable;
+use Tie::File;
 
 our %options;
 
@@ -98,12 +100,22 @@ my $ldap_bind = &bind_to_ldap_server;
 
 sub parse_command_line{
     GetOptions(
-		         f        => \&handle_option,
-				 force    => \&handle_option,
-				 h        => \&handle_option,
-				 help     => \&handle_option,
-				 r        => \&handle_option,
-				 remove   => \&handle_option,
+		         'f'               => \&handle_option,
+				 'force'           => \&handle_option,
+				 'h'               => \&handle_option,
+				 'help'            => \&handle_option,
+				 'r'               => \&handle_option,
+				 'remove'          => \&handle_option,
+			     'R=s'             => \&handle_option,
+				 'root=s'          => \&handle_option,
+				 'Z=s'             => \&handle_option,
+				 'selinux-user=s'  => \&handle_option,
+                 'unsupported'     => \&handle_option,
+				 'keytab=s'        => \&handle_option,
+				 'principal=s'     => \&handle_option,
+				 'realm=s'         => \&handle_option,
+				 'server=s'        => \&handle_option,
+				 'base=s'          => \&handle_option,
 			);
 }
 
@@ -137,7 +149,7 @@ EOI
   	$help_body .= "  -$option$help_text{$option}\n";
   }
   $help_body .= &add_common_help_message; # Additional options for LDAP and Kerberos
-  print STDERR $help_header . $help_body;
+  warn $help_header . $help_body;
   exit 0;
 }
 
@@ -176,8 +188,7 @@ sub validate_login {
 #-------------------------------------------------------------------------------
 
 sub rm_ldap_entry{
-	my $dc = 'dc='.join ',dc=',split /\./,lc $options{realm};
-	my $dn = "uid=${login},$dc";
+	my $dn = "uid=${login},$options{base}";
 	my $result = $ldap_bind->delete($dn);
 	$result->code && warn "Failed to delete LDAP entry for user $login. ".$result->error;
 	# Delete the primary group if necessary:
@@ -214,7 +225,14 @@ sub rm_ldap_entry{
 sub rm_kerberos_principal{
 	my $krb5_princ = Authen::Krb5::parse_name($login) or die Authen::Krb5::error;
 	my $success = $kadm->delete_principal($krb5_princ);
-		die Authen::Krb5::Admin::error unless $success;
+	warn Authen::Krb5::Admin::error unless $success;
+	for ($kadm->get_principals){
+		if ( m{^$login/.*} ) { # If this is another role for our user
+			my $princ = Authen::Krb5::parse_name($_) or die Authen::Krb5::error;
+			$success = $kadm->delete_principal($princ);
+			warn Authen::Krb5::Admin::error unless $success;
+		}
+	}
 }
 
 #-------------------------------------------------------------------------------
@@ -240,11 +258,55 @@ sub check_if_we_can_proceed{
 sub perform_additional_actions {
 	if($options{r}){
 		my $home_dir = (getpwnam $login)[-2];
-		$home_is_being_used = not system "lsof $home_dir";
-		my $can_delete = 1;
-		$can_delete = 0 if $home_is_being_used and not $options{f};
-		remove_tree($home_dir,{ error => \my $error}) if $can_delete;
-		warn "Failed to remove user $login home directory. ".@$error if @$error;
+		if( -d $home_dir ){
+			my $home_is_being_used = not system "lsof $home_dir";
+			my $can_delete = 1;
+			$can_delete = 0 if $home_is_being_used and not $options{f};
+			remove_tree($home_dir,{ error => \my $error}) if $can_delete;
+			warn "Failed to remove user $login home directory. ".@$error if @$error
+		}
+
+		parse_config $logindefs_file;
+		# Delete the mail spool:
+		my $mail_dir = $config_files{$logindefs_file}{MAIL_DIR};
+		my $mail_file = $config_files{$logindefs_file}{MAIL_FILE};
+		my $file;
+		if(defined $mail_dir){ $file = File::Spec->catfile($mail_dir,$login)}
+		elsif( defined $mail_file){ $file = File::Spec->catfile($home_dir,$mail_file)}
+		unlink $file if -e $file;
+
+		# Command to run. Default is adapted from the userdel(8) man page:
+		my $del_cmd = $config_files{$logindefs_file}{USERDEL_CMD}// <<EOI;
+set -- $login
+# Check for the required argument.
+if [ \$# != 1 ]; then
+     echo "Usage: \$0 username"
+     exit 1
+fi
+
+exec 1>/dev/null 2>&1 # Don't emit messages about non-existent crontabs
+# Remove cron jobs.
+crontab -r -u \$1
+
+# Remove at jobs.
+# Note that it will remove any jobs owned by the same UID,
+# even if it was shared by a different username.
+AT_SPOOL_DIR=/var/spool/cron/atjobs
+find \$AT_SPOOL_DIR -name "[^.]*" -type f -user \$1 -delete \;
+
+# Remove print jobs.
+lprm \$1
+
+# All done.
+exit 0
+EOI
+		system($del_cmd)
 	}
-	#TODO: Remove mail spool,crontab,at and any LDAP or Kerberos ACLs relating to the user
+
+	# Remove Kerberos ACLs:
+	my $acl_file = '/etc/krb5kdc/kadm5.acl';
+	my @lines;
+	tie @lines,'Tie::File',$acl_file;
+	@lines = grep { ! m{^$login(?:/.*)?} } @lines;
+	untie @lines;
 }

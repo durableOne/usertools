@@ -118,7 +118,6 @@ our %config_files = (
 	$useradd_file => undef,
 	$logindefs_file => undef,
 );
-
 use UtilitySubs; # Subroutines common to all user tools
 
 #>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -129,7 +128,7 @@ use UtilitySubs; # Subroutines common to all user tools
 &parse_command_line;      # Parse the command line arguments
 my $login = shift @ARGV;  # The log in name is the last thing left after
                           # the command line is parsed.
-&validate_login;						  
+&validate_login;
 &obtain_option_defaults;  # Obtain defaults for options not specified.
                           # Default behaviors are documented in useradd(8)
 
@@ -268,15 +267,15 @@ sub handle_e ($;$) {
 			 || ( $d > 30 && grep { $m == $_ } (4,6,9,11) )
 		);
 				
-	} else { die "Expiry date $v is not in YYYY-MM-DD format!\n" }
+	} else { warn "Expiry date $v is not in YYYY-MM-DD format!\n";exit 1 }
 	$v
 }
 sub handle_f ($;$) { $_[1] }
 
 sub handle_g ($;$) { 
 	my ($o,$v) = @_;
-	if ( $v =~ /^\s*[0-9]+\s*$/ )  { die "The group with GID $v does not exist!\n" unless getgrgid($v) } 
-	else                           { die "The group named $v does not exist!\n" unless getgrnam($v) }
+	if ( $v =~ /^\s*[0-9]+\s*$/ )  { warn "The group with GID $v does not exist!\n" unless getgrgid($v);exit 1 } 
+	else                           { warn "The group named $v does not exist!\n" unless getgrnam($v);exit 1 }
 	$v
 }
 
@@ -340,7 +339,7 @@ EOI
   --policy                      Kerberos policy to be used for creating principals. Defaults
                                 to no policy if not supplied
 EOI
-  print STDERR $help_header . $help_body;
+  warn $help_header . $help_body;
   exit 0;
 }
 
@@ -350,24 +349,23 @@ sub handle_M ($;$) {   1   }
 sub handle_N ($;$) {   1   }
 sub handle_p ($;$) {
 	my ($o,$v) = @_;
-	die "Empty passwords are not allowed!\n" unless defined $v;
-	$v
-}
-sub handle_R ($;$) { 
-	my ($o,$v) = @_;
-	if (! -d $v) {
-		$v = '/';
-		warn "The specified chroot directory $v does not exist. Defaulting to /";
+	unless( defined $v){
+		warn "Empty passwords are not allowed!\n";
+		exit 1
 	}
 	$v
 }
+
 sub handle_s ($;$) { $_[1] }
-sub handle_u ($;$) { $_[1] }
-sub handle_U ($;$) {   1   }
-sub handle_unsupported{
-	my $unsupported = join "\n",map{"  -$_"} grep { length($_) == 1 && !supported $_ } sort keys %options;
-	die "Unsupported options:\n$unsupported\n";
+sub handle_u ($;$) {
+	my ($o,$v) = @_;
+	if( getpwuid $v ){
+		warn "UID $v already exists!\n";
+		exit 1
+	}
+	$v
 }
+sub handle_U ($;$) {   1   }
 
 sub handle_policy    { $_[1] }
 
@@ -437,10 +435,9 @@ sub default_s {
 }
 
 sub default_u { 
-	my @UIDs; #Store existing UIDs
 	my $uid = &get_newid('user',$logindefs_file);
-	die "Failed to obtain a new $uid!\n" unless defined $uid;
-	$options{u} = $uid; # Increment the largest regular user ID used.
+	die "Failed to obtain a new UID!\n" unless defined $uid;
+	$options{u} = $uid
 }
 
 
@@ -578,7 +575,7 @@ sub add_ldap_entry {
 
 sub validate_login{
 	parse_config $nslcd_file;
-	my $valid_name_regex = $config_files{$nslcd_file}{validnames} // qr{^[a-z0-9._\@\$][a-z0-9._\@$ \\~-]*[a-z0-9._\@$~-]$}i;
+	my $valid_name_regex = $config_files{$nslcd_file}{validnames} // qr{^[a-z0-9._\@\$][a-z0-9._\@$ \\~-]*[a-z0-9._\@$~-]*$}i;
 	for($login){
 		die "The user name $_ is invalid. See man 8 useradd and man 5 nslcd.conf for information on constraints.\n"
 		  if 

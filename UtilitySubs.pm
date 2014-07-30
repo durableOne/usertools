@@ -78,8 +78,8 @@ sub supported{ return defined handler $_[0] }
 
 sub obtain_option_defaults{
 	no strict 'refs';
-	for my $option  # Look for supported short options with unspecified values:
-	  (grep { supported $_ and ! defined $main::options{$_} } sort keys %main::options){
+	for my $option  # Look for supported options with unspecified values:
+	  (grep { ! defined $main::options{$_} } sort keys %main::options){
 		  # Call the subroutine that obtains the option's default value if it exists:
 		  $main::options{$option} = &{"main::default_$option"} if exists ${main::}{"default_$option"} ;
 		  if( exists $main::synonyms{$option} ) { $main::options{$main::synonyms{$option}} = $main::options{$option} }
@@ -256,6 +256,12 @@ sub ldap_is_up {
 
 
 sub get_newid ($) {
+	# Make sure we can contact the LDAP server first:
+	no strict 'refs';
+	for (qw(realm keytab principal server base)){
+		&{"main::default_$_"} if not defined $main::options{$_};
+	}
+	use strict 'refs';
 	my $entity = shift//'user';
 	my $logindefs_file = shift;
 	my ($min,$max,$id,@IDs);
@@ -336,6 +342,11 @@ EOI
 #
 #-------------------------------------------------------------------------------
 
+sub handle_unsupported{
+	my $unsupported = join "\n",map{"  -$_"} grep { length($_) == 1 && !supported $_ } sort keys %main::options;
+	print STDERR "Unsupported options:\n$unsupported\n";
+	exit 0
+}
 sub handle_keytab    { $_[1] }
 sub handle_principal { 
 	my ($o,$v) = @_;
