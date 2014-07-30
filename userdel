@@ -206,7 +206,7 @@ sub rm_ldap_entry{
 			}
 			if ( $gid_in_use ){
 				if ($options{f}){
-					 $dn = "cn=$login,$dc";
+					 $dn = "cn=$login,$options{base}";
 					 $result = $ldap_bind->delete($dn);
 					 $result->code && warn "Failed to delete LDAP entry for group $login. ".$result->error;
 				}
