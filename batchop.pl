@@ -71,6 +71,8 @@ while(<$FH>){
 	chomp;
 	if($new_tool){
 		$tool_name = $_;
+		$tool_name = `bash -c 'type -P $tool_name'`;
+		chomp $tool_name;
 		if( not -x $tool_name ){
 			warn "Tool $_ specified in the input file not found. Skipping...\n";
 			$_=<$FH> until /----*/; # Discard input lines until the next new tool.
@@ -110,7 +112,7 @@ for my $tool (keys %invocations){
 			my @option_args = split /\s*$delimiter/,$invocation;
 			my $command_string ='';
 			for(0..$#option_args){
-				$command_string .= $option_names[$_] . ' ' . $option_args[$_] . ' ';
+				$command_string .= $option_names[$_] . ' ' . qq{'$option_args[$_]'} . ' ';
 			}
 			$command_string = $tool . ' ' . $command_string;
 			if( system($command_string) ){ # Execution failed

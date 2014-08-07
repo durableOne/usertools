@@ -413,7 +413,7 @@ sub default_g {
 		  $options{g} = $config_files{$file2}{GROUP} // 100
 	}
 	elsif($config_files{$file1}{USERGROUPS_ENAB} eq 'yes'){
-		  $options{g} = $login
+		  $options{g} = $login;
 	}
 	else { $options{g} = $config_files{$file2}{GROUP} // 100 }
 }
@@ -510,15 +510,15 @@ sub add_ldap_entry {
 		my $cn = $login;
 		my $sn = $login;
 		my $gecos = $login;
-		if(defined $options{c}){
+		if(defined $options{c} and $options{c} ne ''){
 			$gecos = $options{c};
 			$cn = (split /,/,$options{c})[0];
 			$sn = (split / /,$cn        )[0];
 		}
 
 		my @groups = (&getgname($options{g}));
-		if(defined $options{G}){
-		  push @groups, &getgname(@{$options{G}});
+		if(defined $options{G} and $options{G} ne ''){
+		  push @groups, map {&getgname($_)}(@{$options{G}});
 	    }
 		my $primary_group = shift @groups;
 		if( $primary_group eq $login and not &group_exists($primary_group) ) {
